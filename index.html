@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Карта угроз</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+:root{--bg:#14171c;--panel:#1d2128;--text:#e8eaed;--muted:#8b93a1;--red:#ff4d4f;--yellow:#ffb020;--line:#2b313b}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+#map{position:absolute;inset:0;background:var(--bg)}
+.bar{position:absolute;z-index:1000;left:8px;right:8px;top:calc(8px + env(safe-area-inset-top,0px));display:flex;gap:6px;flex-wrap:wrap}
+.chip{background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:18px;padding:6px 12px;font:inherit;cursor:pointer}
+.chip[aria-pressed=true]{border-color:var(--text)}
+.chip i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
+.sheet{position:absolute;z-index:1000;left:0;right:0;bottom:0;max-height:38%;overflow:auto;background:var(--panel);border-top:1px solid var(--line);padding:8px 12px calc(10px + env(safe-area-inset-bottom,0px));border-radius:14px 14px 0 0}
+.sheet h2{font-size:13px;margin:0 0 6px;color:var(--muted);font-weight:500}
+.row{display:flex;gap:10px;padding:8px 0;border-top:1px solid var(--line);cursor:pointer}
+.row:first-of-type{border-top:0}
+.dot{flex:none;width:10px;height:10px;border-radius:50%;margin-top:5px}
+.row b{display:block}.row small{color:var(--muted)}
+.empty{color:var(--muted);padding:8px 0}
+.pin{position:relative;width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:14px;border:2px solid #fff;box-shadow:0 0 0 0 currentColor}
+.pin.red{background:var(--red);color:var(--red);animation:pulse 1.6s infinite}
+.pin.yellow{background:var(--yellow);color:var(--yellow)}
+@keyframes pulse{70%{box-shadow:0 0 0 14px transparent}100%{box-shadow:0 0 0 0 transparent}}
+@media (prefers-reduced-motion:reduce){.pin.red{animation:none}}
+.arrow{font-size:20px;line-height:20px;text-align:center}
+.leaflet-container{font:inherit}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="bar">
+  <button class="chip" data-f="all" aria-pressed="true">Все</button>
+  <button class="chip" data-f="red" aria-pressed="false"><i style="background:var(--red)"></i>Красный</button>
+  <button class="chip" data-f="yellow" aria-pressed="false"><i style="background:var(--yellow)"></i>Жёлтый</button>
+</div>
+<div class="sheet"><h2 id="status">Загрузка…</h2><div id="list"></div></div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const DEMO = new URLSearchParams(location.search).has("demo");
+const COLORS = {red:"#ff4d4f", yellow:"#ffb020"};
+const ICONS = {uav:"🛩", missile:"🚀", aviation:"✈️"};
+const NAMES = {uav:"БпЛА", missile:"Ракеты", aviation:"Авиация"};
+let filter = "all", events = [], seenRed = new Set();
+
+const map = L.map("map", {zoomControl:false, attributionControl:false}).setView([49, 31.5], 6);
+L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {maxZoom:12, subdomains:"abcd"}).addTo(map);
+const layer = L.layerGroup().addTo(map);
+
+function destination(lat, lon, deg, km){
+  const R=6371, b=deg*Math.PI/180, p1=lat*Math.PI/180, l1=lon*Math.PI/180, d=km/R;
+  const p2=Math.asin(Math.sin(p1)*Math.cos(d)+Math.cos(p1)*Math.sin(d)*Math.cos(b));
+  const l2=l1+Math.atan2(Math.sin(b)*Math.sin(d)*Math.cos(p1), Math.cos(d)-Math.sin(p1)*Math.sin(p2));
+  return [p2*180/Math.PI, l2*180/Math.PI];
+}
+function bearing(a,b){
+  const r=x=>x*Math.PI/180, y=Math.sin(r(b[1]-a[1]))*Math.cos(r(b[0]));
+  const x=Math.cos(r(a[0]))*Math.sin(r(b[0]))-Math.sin(r(a[0]))*Math.cos(r(b[0]))*Math.cos(r(b[1]-a[1]));
+  return (Math.atan2(y,x)*180/Math.PI+360)%360;
+}
+const ago = ts => { const m=Math.max(0,Math.round((Date.now()/1000-ts)/60)); return m<1?"только что":m+" мин назад"; };
+
+function render(){
+  layer.clearLayers();
+  const list = events.filter(e => filter==="all" || e.level===filter).sort((a,b)=>b.ts-a.ts);
+  const box = document.getElementById("list"); box.innerHTML = "";
+  list.forEach(e => {
+    const c = COLORS[e.level], pos = [e.lat, e.lon];
+    L.marker(pos, {icon:L.divIcon({className:"", html:`<div class="pin ${e.level}">${ICONS[e.type]||"⚠️"}</div>`, iconSize:[26,26], iconAnchor:[13,13]})})
+      .bindPopup(`<b>${NAMES[e.type]||"Угроза"} · ${e.place}</b><br>${e.text}<br><small>${e.source} · ${ago(e.ts)}</small>`).addTo(layer);
+    if (e.heading != null || e.target) {
+      const end = e.target ? [e.target.lat, e.target.lon] : destination(e.lat, e.lon, e.heading, 70);
+      const hd = e.target ? bearing(pos, end) : e.heading;
+      L.polyline([pos, end], {color:c, weight:3, opacity:.85, dashArray:"6 8"}).addTo(layer);
+      L.marker(end, {interactive:false, icon:L.divIcon({className:"", iconSize:[20,20], iconAnchor:[10,10],
+        html:`<div class="arrow" style="color:${c};transform:rotate(${hd}deg)">▲</div>`})}).addTo(layer);
+    }
+    const row = document.createElement("div"); row.className = "row";
+    const dir = e.target ? ` → ${e.target.name}` : (e.heading!=null ? ` · курс ${e.heading}°` : "");
+    row.innerHTML = `<span class="dot" style="background:${c}"></span><div><b>${NAMES[e.type]||"Угроза"} · ${e.place}${dir}</b><small>${ago(e.ts)} · ${e.source}</small></div>`;
+    row.onclick = () => map.flyTo(pos, 8);
+    box.appendChild(row);
+  });
+  document.getElementById("status").textContent = list.length ? `Активно: ${list.length}` : "";
+  if (!list.length) box.innerHTML = '<div class="empty">Сейчас угроз на карте нет</div>';
+}
+
+function demoEvents(){
+  const t = Date.now()/1000;
+  return [
+    {id:"d1",ts:t-120,type:"uav",level:"yellow",place:"Суми",lat:50.91,lon:34.8,heading:187,target:{name:"Полтава",lat:49.59,lon:34.55},source:"demo",text:"БпЛА з Сумщини курсом на Полтаву"},
+    {id:"d2",ts:t-60,type:"missile",level:"red",place:"Київ",lat:50.45,lon:30.52,heading:180,target:null,source:"demo",text:"Ракета з півночі, Київ"},
+    {id:"d3",ts:t-300,type:"uav",level:"yellow",place:"Одеса",lat:46.48,lon:30.73,heading:0,target:null,source:"demo",text:"Шахеди в районі Одеси"}
+  ];
+}
+
+async function load(){
+  try {
+    if (DEMO) events = demoEvents();
+    else {
+      const r = await fetch("/api/events", {headers:{"X-TG-Init-Data": tg?.initData || ""}});
+      if (!r.ok) throw new Error(r.status === 401 ? "Откройте карту из Telegram" : "Ошибка сервера " + r.status);
+      events = (await r.json()).events;
+    }
+    events.filter(e => e.level==="red" && !seenRed.has(e.id)).forEach(e => { seenRed.add(e.id); tg?.HapticFeedback?.notificationOccurred("warning"); });
+    render();
+  } catch (err) {
+    document.getElementById("status").textContent = err.message + ". Повтор через 5 секунд.";
+  }
+}
+
+document.querySelectorAll(".chip").forEach(b => b.onclick = () => {
+  filter = b.dataset.f;
+  document.querySelectorAll(".chip").forEach(x => x.setAttribute("aria-pressed", x === b));
+  render();
+});
+load(); setInterval(load, 5000);
+</script>
+</body>
+</html>
